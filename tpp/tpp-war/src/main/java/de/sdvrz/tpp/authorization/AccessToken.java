@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2018 SDV-IT, Sparda Datenverarbeitung eG
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,11 @@
  */
 package de.sdvrz.tpp.authorization;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import de.sdvrz.tpp.PropertyManager;
+import de.sdvrz.tpp.authorization.model.AccessTokenResponseErrorModel;
+import de.sdvrz.tpp.authorization.model.AccessTokenResponseModel;
+import de.sdvrz.tpp.authorization.model.AuthorizationModel;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -23,23 +28,18 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.Base64;
 import java.util.Random;
-
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import javax.ejb.Stateless;
 import javax.ejb.TransactionManagement;
 import javax.ejb.TransactionManagementType;
+import javax.enterprise.concurrent.ManagedScheduledExecutorService;
 import javax.faces.context.ExternalContext;
 import javax.faces.context.FacesContext;
 import javax.inject.Inject;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-
-import de.sdvrz.tpp.PropertyManager;
-import de.sdvrz.tpp.authorization.model.AccessTokenResponseErrorModel;
-import de.sdvrz.tpp.authorization.model.AccessTokenResponseModel;
-import de.sdvrz.tpp.authorization.model.AuthorizationModel;
 
 /**
  * Class to obtain Access Token from Authorization Server
@@ -59,12 +59,13 @@ public class AccessToken {
 	@Inject
 	PropertyManager propertyManager;
 
+	@Inject
+	ManagedScheduledExecutorService managedScheduledExecutorService;
+
 	/**
 	 * Access Token will be obtained
 	 */
 	public void getAccessToken() {
-		LOG.debug("getAccessToken() Start");
-
 		resetErrorMessages();
 
 		if ("".equals(model.getAccessTokenResponseModel().getRefresh_token())) {
@@ -72,34 +73,42 @@ public class AccessToken {
 			getAuthorizationCode();
 			// redirection for Authorization Code can take any time and
 			// redirection is asynchronous
-			// so hier must be waiting for return
-			if (!waitForAuthorizationCode()) {
-				// error from Authorization Server
-				LOG.error("getAccessToken() waitForAuthorizationCode() with error - Access Token can not be obtained");
+			try {
+				managedScheduledExecutorService
+						.schedule(this::waitForAuthorizationCode, 250, TimeUnit.MILLISECONDS)
+						.get(1, TimeUnit.MINUTES);
+			} catch (ExecutionException e) {
+				LOG.error("Uncaught exception in scheduled execution", e.getCause());
+			} catch (TimeoutException e) {
+				model.setError("Timeout");
+				model.setErrorDescription("60 sec. to authorize by identify provider exceeded");
+				LOG.error("Timeout while waiting - Access Token can not be obtained");
 				return;
+			} catch (InterruptedException e) {
+				LOG.info("Waiting for Access Token has been canceled");
 			}
-			if ("".equals(model.getAuthorizationCode())) {
+
+			if (!model.getAuthorizationCode().isPresent()) {
 				// error from Authorization Server - no more actions to do
 				LOG.error("getAccessToken() no Authorization Code received - Access Token can not be obtained");
 				return;
 			}
 		}
 
-		LOG.debug("getAccessToken() Authorization Code: {}, Access Token Model: {}", model.getAuthorizationCode(),
+		LOG.debug("Authorization Code: {}, Access Token Model: {}", model.getAuthorizationCode().orElse(""),
 				model.getAccessTokenResponseModel());
 
 		String url = buildUrlForAccessToken();
 
 		// client_id:client_secret
-		String clientIdAndSecret = new StringBuilder().append(propertyManager.getProperty("client.id")).append(':')
-				.append(propertyManager.getProperty("client.secret")).toString();
+		String clientIdAndSecret = propertyManager.getProperty("client.id") + ':' + propertyManager.getProperty("client.secret");
 		// client_id:client_secret Base64 encoded
 		String clientIdAndSecretBase64Encoded = Base64.getEncoder().encodeToString(clientIdAndSecret.getBytes());
 
 		try {
 			// RESTFul Request for Access Token with Authorization Code or
 			// Refresh Token
-			HttpURLConnection httpURLConnection = (HttpURLConnection) new URL(url.toString()).openConnection();
+			HttpURLConnection httpURLConnection = (HttpURLConnection) new URL(url).openConnection();
 			httpURLConnection.setDoOutput(true);
 			httpURLConnection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
 			httpURLConnection.setRequestProperty("Authorization", "Basic " + clientIdAndSecretBase64Encoded);
@@ -131,7 +140,7 @@ public class AccessToken {
 				if (httpURLConnection.getErrorStream() != null) {
 					BufferedReader br = new BufferedReader(
 							new InputStreamReader(httpURLConnection.getErrorStream(), "UTF-8"));
-					String line = null;
+					String line;
 					while ((line = br.readLine()) != null) {
 						sb.append(line + "\n");
 					}
@@ -152,14 +161,14 @@ public class AccessToken {
 			}
 
 		} catch (MalformedURLException e) {
-			LOG.error("getAccessToken() MalformedURLException: {}", e.getMessage());
+			LOG.error("Error", e);
 		} catch (IOException e) {
 			model.setError("IOException");
 			model.setErrorDescription(e.getMessage());
 			// Access Token, if any, is no longer valid - next step should be
 			// get Authorization Code
 			model.setAccessTokenResponseModel(new AccessTokenResponseModel());
-			LOG.error("getAccessToken() IOException: {}", e.getMessage(), e);
+			LOG.error("IOException: {}", e);
 		}
 	}
 
@@ -179,10 +188,8 @@ public class AccessToken {
 	 * Authorization Code will be get
 	 */
 	private void getAuthorizationCode() {
-		LOG.debug("getAuthorizationCode() Start");
-
 		// old Authorization Code, if any, must be discarded
-		model.setAuthorizationCode("");
+		model.setAuthorizationCode(null);
 
 		ExternalContext ec = FacesContext.getCurrentInstance().getExternalContext();
 		String url = buildUrlForAuthorizationCode();
@@ -191,9 +198,9 @@ public class AccessToken {
 			// Authorization Server needs to be redirected to
 			// - user should perform his action (authentication) direct on
 			// Authorization Server
-			ec.redirect(url.toString());
+			ec.redirect(url);
 		} catch (Exception e) {
-			LOG.error("getAuthorizationCode() {}: {}", e.getClass().getSimpleName(), e.getMessage());
+			LOG.error("Error during redirect to '{}'", url, e);
 		}
 	}
 
@@ -203,7 +210,6 @@ public class AccessToken {
 	 * @return URL for get Authorization Code request
 	 */
 	private String buildUrlForAuthorizationCode() {
-		LOG.debug("buildUrlForAuthorizationCode() Start");
 		ExternalContext ec = FacesContext.getCurrentInstance().getExternalContext();
 		String url = new StringBuilder().append(propertyManager.getProperty("authorization.server.schema"))
 				.append("://").append(propertyManager.getProperty("authorization.server.address")).append(':')
@@ -215,37 +221,27 @@ public class AccessToken {
 				.append("client_id=").append(propertyManager.getProperty("client.id")).append('&')
 				.append("bic=").append(propertyManager.getProperty("authorization.server.bic")).append('&')
 				.append("state=").append(new Random().nextInt()).toString();
-
-		LOG.debug("buildUrlForAuthorizationCode() End url: {}", url);
 		return url;
 	}
 
 	/**
 	 * Wait until Authorization Code is get or Error is received
+	 * Managed by ManagedScheduledExecutorService
 	 */
 	private boolean waitForAuthorizationCode() {
-		
-		int count = 0;
-		while (++count < 3 * 60) { // max 1 minute
-			if (model.getAuthorizationCode() != null && model.getAuthorizationCode().length() > 0) {
-				LOG.info("waitForAuthorizationCode() End AuthorizationCode received, return true");
+		while(true) {
+			if (model.getAuthorizationCode().isPresent()) {
 				return true;
 			}
 			if (model.getError() != null && model.getError().length() > 0) {
-				LOG.info("waitForAuthorizationCode() End Error received, return false");
 				return false;
 			}
-			
 			try {
-				Thread.sleep(333);
+				Thread.sleep(100);
 			} catch (InterruptedException e) {
-
+				Thread.currentThread().interrupt();
 			}
 		}
-		model.setError("Timed out");
-		model.setErrorDescription("60 sec. to authorize by Identify Provider exceeded");
-		LOG.info("waitForAuthorizationCode() End Timed out, return false");
-		return false;
 	}
 
 	/**
@@ -254,24 +250,20 @@ public class AccessToken {
 	 * @return URL for get Access Token request
 	 */
 	private String buildUrlForAccessToken() {
-		LOG.debug("buildUrlForAccessToken() Start");
 		ExternalContext ec = FacesContext.getCurrentInstance().getExternalContext();
-		String url = new StringBuilder().append(propertyManager.getProperty("authorization.server.schema"))
-				.append("://").append(propertyManager.getProperty("authorization.server.address")).append(':')
-				.append(propertyManager.getProperty("authorization.server.port"))
-				.append(propertyManager.getProperty("authorization.server.authorization.token.path")).append('?')
-				.append('&').append("grant_type=")
-				.append("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? "authorization_code"
-						: "refresh_token")
-				.append('&').append("redirect_uri=").append(ec.getRequestScheme()).append("://")
-				.append(ec.getRequestServerName()).append(':').append(ec.getRequestServerPort())
-				.append(ec.getRequestContextPath()).append('&')
-				.append("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? "code=" : "refresh_token=")
-				.append("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? model.getAuthorizationCode()
-						: model.getAccessTokenResponseModel().getRefresh_token())
-				.toString();
-
-		LOG.debug("buildUrlForAccessToken() End url: {}", url);
+		String url = propertyManager.getProperty("authorization.server.schema")
+				+ "://" + propertyManager.getProperty("authorization.server.address") + ':'
+				+ propertyManager.getProperty("authorization.server.port")
+				+ propertyManager.getProperty("authorization.server.authorization.token.path") + '?'
+				+ '&' + "grant_type="
+				+ ("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? "authorization_code"
+				: "refresh_token")
+				+ '&' + "redirect_uri=" + ec.getRequestScheme() + "://"
+				+ ec.getRequestServerName() + ':' + ec.getRequestServerPort()
+				+ ec.getRequestContextPath() + '&'
+				+ ("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? "code=" : "refresh_token=")
+				+ ("".equals(model.getAccessTokenResponseModel().getRefresh_token()) ? model.getAuthorizationCode().orElse("")
+				: model.getAccessTokenResponseModel().getRefresh_token());
 		return url;
 	}
 
