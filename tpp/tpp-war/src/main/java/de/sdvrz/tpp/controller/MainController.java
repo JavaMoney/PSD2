@@ -20,9 +20,6 @@ import javax.enterprise.context.ApplicationScoped;
 import javax.inject.Inject;
 import javax.inject.Named;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import de.sdvrz.tpp.PropertyManager;
 import de.sdvrz.tpp.authorization.AccessToken;
 import de.sdvrz.tpp.authorization.model.AuthorizationModel;

@@ -5,11 +5,11 @@
     "version" : "0.9.2-SNAPSHOT",
     "title" : "XS2A Services",
     "contact" : {
-      "name" : "Andreas Reetz",
-      "email" : "andreas.reetz@sdv-it.de"
+      "name" : "Piotr Wiczewski",
+      "email" : "piotr.wiczewski@spb.de"
     }
   },
-  "host" : "api.sdv-it.de",
+  "host" : "uedaexj1.spb.de:8080",
   "basePath" : "/tpp",
   "tags" : [ {
     "name" : "Accounts"
